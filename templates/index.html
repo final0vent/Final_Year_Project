@@ -214,34 +214,33 @@
       </div>
 
       {% if events %}
-        <table id="log-table" class="doc-table">
-          <thead>
+      <table id="log-table" class="doc-table">
+        <thead>
           <tr>
-            <th class="th-timestamp">@timestamp</th>
-            <th>message</th>
-            <th>event.category</th>
-            <th>event.action</th>
-            <th>host.name</th>
-            <th>source.ip</th>
-            <th>destination.ip</th>
-            <th>user.name</th>
+            {% for h in headers %}
+              <th class="{% if h == '@timestamp' %}th-timestamp{% endif %}">{{ h }}</th>
+            {% endfor %}
           </tr>
-          </thead>
-          <tbody>
+        </thead>
+
+        <tbody>
           {% for e in events %}
             <tr>
-              <td class="cell-timestamp">{{ e.timestamp if e.timestamp else '-' }}</td>
-              <td class="cell-message"><pre>{{ e.message or e.raw }}</pre></td>
-              <td class="cell-dim">{{ e['event.category'] or '-' }}</td>
-              <td class="cell-dim">{{ e['event.action'] or '-' }}</td>
-              <td class="cell-dim">{{ e['host.name'] or '-' }}</td>
-              <td class="cell-dim">{{ e['source.ip'] or '-' }}</td>
-              <td class="cell-dim">{{ e['destination.ip'] or '-' }}</td>
-              <td class="cell-dim">{{ e['user.name'] or '-' }}</td>
+              {% for h in headers %}
+                {% set val = e.get(h) %}
+                {% if h == 'message' %}
+                  <td class="cell-message"><pre>{{ val if val is not none and val != '' else (e.raw or '-') }}</pre></td>
+                {% elif h == '@timestamp' %}
+                  <td class="cell-timestamp">{{ val if val else '-' }}</td>
+                {% else %}
+                  <td class="cell-dim">{{ val if val is not none and val != '' else '-' }}</td>
+                {% endif %}
+              {% endfor %}
             </tr>
           {% endfor %}
-          </tbody>
-        </table>
+        </tbody>
+      </table>
+
 
         <div class="pagination-bar">
           <span id="rows-info"></span>

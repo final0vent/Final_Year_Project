@@ -127,7 +127,7 @@ def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any]
     ev = {
         "id": line_no,
         "raw": json.dumps(obj, ensure_ascii=False),
-        "timestamp": ts_raw,
+        "@timestamp": ts_raw,
         "timestamp_dt": ts_dt,
         "message": obj.get("message", ""),
 
@@ -142,6 +142,7 @@ def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any]
         "process.name": obj.get("process", {}).get("name") if isinstance(obj.get("process"), dict) else None,
         "process.pid": obj.get("process", {}).get("pid") if isinstance(obj.get("process"), dict) else None,
         "process.command_line": obj.get("process", {}).get("command_line") if isinstance(obj.get("process"), dict) else None,
+        "network": obj.get("network"),
 
         "structured": obj,
     }
@@ -154,11 +155,33 @@ def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any]
     return ev, warnings
 
 def parse_ndjson_file(file_storage):
+    """
+    File format:
+      - Line 1: header row, comma-separated (NOT JSON)
+      - Line 2..n: NDJSON rows (each line is a JSON object)
+    """
     events, errors, warns = [], [], []
-    for idx, raw in enumerate(file_storage.stream, start=1):
+    headers = []
+
+    raw_lines = list(file_storage.stream)
+
+    header_line_no = None
+    for i, raw in enumerate(raw_lines, start=1):
+        line = raw.decode("utf-8", errors="ignore").strip()
+        if line:
+            header_line_no = i
+            headers = [h.strip() for h in line.split(",") if h.strip()]
+            break
+
+    if header_line_no is None:
+        errors.append({"line": 1, "error": "empty file"})
+        return [], errors, warns, []
+
+    for idx, raw in enumerate(raw_lines[header_line_no:], start=header_line_no + 1):
         line = raw.decode("utf-8", errors="ignore").strip()
         if not line:
             continue
+
         try:
             obj = json.loads(line)
         except Exception as e:
@@ -172,7 +195,9 @@ def parse_ndjson_file(file_storage):
 
         events.append(ev)
         warns.extend(w)
-    return events, errors, warns
+
+    return events, errors, warns, headers
+
 
 
 # -------- Events over time --------
@@ -250,13 +275,16 @@ def build_histogram(events):
 
 ALL_EVENTS = []
 LAST_FILENAME = None
+TABLE_HEADERS = []
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     global ALL_EVENTS, LAST_FILENAME
 
+    global TABLE_HEADERS
     events = ALL_EVENTS
     filename = LAST_FILENAME
+    headers = TABLE_HEADERS
 
     hist_buckets = []
     hist_interval_label = None
@@ -274,10 +302,11 @@ def index():
         uploaded = request.files.get("logfile")
         if uploaded and uploaded.filename:
             filename = uploaded.filename
-            events, parse_errors, parse_warnings = parse_ndjson_file(uploaded)
+            events, parse_errors, parse_warnings, headers = parse_ndjson_file(uploaded)
 
             ALL_EVENTS = events
             LAST_FILENAME = filename
+            TABLE_HEADERS = headers
 
     kql_query = (request.values.get("kql") or "").strip()
 
@@ -309,6 +338,7 @@ def index():
         kql_query=kql_query,
         parse_errors=parse_errors[:200],
         parse_warnings=parse_warnings[:200],
+        headers=headers,
 
         has_rule_warnings=has_rule_warnings,
         rule_warnings=rule_warnings,
