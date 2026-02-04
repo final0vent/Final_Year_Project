@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Mini SIEM Discover</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+<div class="app-shell">
+  <!-- Left sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-top">
+      <div class="logo-circle">S</div>
+      <div class="project-name">FYP-demo</div>
+    </div>
+
+    <nav class="nav-menu">
+      <div class="nav-section-title">Security</div>
+      <a class="nav-item active" href="#">
+        <span class="nav-icon">🔍</span>
+        <span>Discover</span>
+      </a>
+    </nav>
+
+    {% if has_rule_warnings %}
+      <div class="sidebar-warning">
+        <div class="sidebar-warning-header">
+          <span class="sidebar-warning-icon">⚠</span>
+          <span class="sidebar-warning-title">
+            {{ rule_warnings|length }} Warnings detected
+          </span>
+        </div>
+
+        <div class="sidebar-warning-list">
+          {% for w in rule_warnings[:3] %}
+            <div class="sidebar-warning-item">
+              <div class="sidebar-warning-rule">
+                {{ w.rule_id }} <span class="sev-tag sev-{{ w.severity|lower }}">{{ w.severity }}</span>
+              </div>
+              {% if w.event_category %}
+                <div class="sidebar-warning-meta">
+                  {{ w.event_category }}{% if w.timestamp %} · {{ w.timestamp }}{% endif %}
+                </div>
+              {% endif %}
+              <div class="sidebar-warning-msg">
+                {{ w.message }}
+              </div>
+            </div>
+          {% endfor %}
+
+          {% if rule_warnings|length > 3 %}
+            <div class="sidebar-warning-more">
+              + {{ rule_warnings|length - 3 }} more…
+            </div>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+  </aside>
+
+
+  <!-- main panel -->
+  <div class="main-panel">
+    <!-- top bar -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <input class="view-name" value="FYP-Demo" />
+      </div>
+    </header>
+
+    <!-- search & upload -->
+    <section class="controls">
+      <div class="controls-row">
+
+        <!-- KQL bar -->
+        <div class="kql-bar">
+          <form method="get" class="kql-form">
+            <input
+              id="kql-input"
+              type="text"
+              name="kql"
+              value="{{ kql_query or '' }}"
+              placeholder='Use mini KQL, e.g. event.category:authentication AND destination.port:53' />
+            <button type="submit" class="btn ghost small">Run</button>
+          </form>
+
+          <!-- NL -> KQL -->
+          <div class="nl2kql-box">
+            <input
+              type="text"
+              id="nl-query-input"
+              placeholder="Please describe what kind of event you want to search for.">
+            <button type="button" class="btn small" id="nl2kql-btn">|Ask AI|</button>
+          </div>
+
+          <div id="nl2kql-result" class="nl2kql-result hidden">
+            <div class="nl2kql-kql">
+              <label>Generated KQL:</label>
+              <code id="nl2kql-kql-text"></code>
+            </div>
+            <div class="nl2kql-explanation">
+              <label>Explanation:</label>
+              <p id="nl2kql-explanation-text"></p>
+            </div>
+            <div class="nl2kql-warnings">
+              <label>Warnings:</label>
+              <p id="nl2kql-warnings-text"></p>
+            </div>
+            <div class="nl2kql-actions">
+              <button type="button" class="btn small primary" id="apply-kql-btn">Use this query</button>
+              <button type="button" class="btn small ghost" id="apply-and-run-btn">Use &amp; Run</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- upload form -->
+      <form class="upload-form" method="post" enctype="multipart/form-data">
+        <label for="logfile">Upload file:</label>
+        <input type="file" id="logfile" name="logfile" accept=".ndjson,.log,.txt,application/x-ndjson,application/json" required>
+        <button class="btn secondary" type="submit">Upload</button>
+        {% if filename %}
+          <span class="current-file">Current file: {{ filename }}</span>
+        {% endif %}
+      </form>
+
+      <!-- parse errors / warnings -->
+      {% if parse_errors and parse_errors|length > 0 or parse_warnings and parse_warnings|length > 0 %}
+      <div class="panel parse-panel">
+        {% if parse_errors and parse_errors|length > 0 %}
+          <div class="panel-section">
+            <div class="panel-title error">Parse Errors (first {{ parse_errors|length }})</div>
+            <ul class="list">
+              {% for err in parse_errors %}
+                <li>Line {{ err.line }} — {{ err.error }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% endif %}
+        {% if parse_warnings and parse_warnings|length > 0 %}
+          <div class="panel-section">
+            <div class="panel-title warn">Warnings (first {{ parse_warnings|length }})</div>
+            <ul class="list">
+              {% for w in parse_warnings %}
+                <li>{{ w }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% endif %}
+      </div>
+      {% endif %}
+    </section>
+
+    <!-- histogram：Events over time -->
+    <section class="histogram-card">
+      <div class="histogram-header">
+        <span>Events over time</span>
+        <span class="histogram-interval">
+          Interval:
+          {% if hist_interval_label %}
+            {{ hist_interval_label }}
+          {% else %}
+            -
+          {% endif %}
+        </span>
+      </div>
+
+      {% if hist_buckets %}
+        <div class="histogram-body">
+          <div class="histogram-y-axis">
+            {% for t in hist_y_ticks|reverse %}
+              <div class="y-tick">
+                <span class="y-tick-label">{{ t }}</span>
+              </div>
+            {% endfor %}
+          </div>
+
+          <div class="histogram-bars">
+            {% for b in hist_buckets %}
+              <div class="bar" style="height: {{ b.height }}%;">
+                <span class="bar-tooltip">
+                  {{ b.label }}<br>
+                  {{ b.count }} events
+                </span>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="histogram-x-axis">
+          <span class="x-label x-label-start">
+            {% if hist_x_start %}{{ hist_x_start }}{% endif %}
+          </span>
+          <span class="x-label x-label-mid">
+            25 buckets
+          </span>
+          <span class="x-label x-label-end">
+            {% if hist_x_end %}{{ hist_x_end }}{% endif %}
+          </span>
+        </div>
+      {% else %}
+        <div class="histogram-placeholder">
+          <p class="hint">No timestamp data to build histogram.</p>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="documents-card">
+      <div class="documents-header">
+        <div>
+          <span class="documents-title">Documents</span>
+          <span class="pill">{{ events|length }}</span>
+        </div>
+      </div>
+
+      {% if events %}
+        <table id="log-table" class="doc-table">
+          <thead>
+          <tr>
+            <th class="th-timestamp">@timestamp</th>
+            <th>message</th>
+            <th>event.category</th>
+            <th>event.action</th>
+            <th>host.name</th>
+            <th>source.ip</th>
+            <th>destination.ip</th>
+            <th>user.name</th>
+          </tr>
+          </thead>
+          <tbody>
+          {% for e in events %}
+            <tr>
+              <td class="cell-timestamp">{{ e.timestamp if e.timestamp else '-' }}</td>
+              <td class="cell-message"><pre>{{ e.message or e.raw }}</pre></td>
+              <td class="cell-dim">{{ e['event.category'] or '-' }}</td>
+              <td class="cell-dim">{{ e['event.action'] or '-' }}</td>
+              <td class="cell-dim">{{ e['host.name'] or '-' }}</td>
+              <td class="cell-dim">{{ e['source.ip'] or '-' }}</td>
+              <td class="cell-dim">{{ e['destination.ip'] or '-' }}</td>
+              <td class="cell-dim">{{ e['user.name'] or '-' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+
+        <div class="pagination-bar">
+          <span id="rows-info"></span>
+          <div class="pagination-right">
+            <button type="button" class="btn ghost small" id="prev-page">&lt;</button>
+            <span id="page-info"></span>
+            <button type="button" class="btn ghost small" id="next-page">&gt;</button>
+          </div>
+        </div>
+
+      {% else %}
+        <p class="hint">
+          No documents yet. Upload an ECS NDJSON file above to start exploring your data.
+        </p>
+      {% endif %}
+    </section>
+  </div>
+</div>
+
+
+<script>
+  const ROWS_PER_PAGE = 8;
+
+  const table = document.getElementById("log-table");
+  const rowsInfo = document.getElementById("rows-info");
+  const pageInfo = document.getElementById("page-info");
+  const prevBtn = document.getElementById("prev-page");
+  const nextBtn = document.getElementById("next-page");
+
+  let rows = [];
+  let currentPage = 1;
+
+  if (table) {
+    rows = Array.from(table.querySelectorAll("tbody tr"));
+  }
+
+  function getMatchedRows() {
+    // 如需前端过滤可在此加入匹配逻辑；目前直接返回全部行
+    return rows;
+  }
+
+  function renderPage(page) {
+    const matched = getMatchedRows();
+    const total = matched.length;
+    const totalPages = Math.max(1, Math.ceil(total / ROWS_PER_PAGE));
+
+    if (page < 1) page = 1;
+    if (page > totalPages) page = totalPages;
+    currentPage = page;
+
+    rows.forEach(r => r.style.display = "none");
+
+    const start = (page - 1) * ROWS_PER_PAGE;
+    const end = start + ROWS_PER_PAGE;
+    matched.slice(start, end).forEach(r => {
+      r.style.display = "";
+    });
+
+    if (rowsInfo) {
+      rowsInfo.textContent = `Rows per page: ${ROWS_PER_PAGE}, total: ${total}`;
+    }
+    if (pageInfo) {
+      pageInfo.textContent = `Page ${currentPage} of ${totalPages}`;
+    }
+
+    if (prevBtn) prevBtn.disabled = currentPage === 1;
+    if (nextBtn) nextBtn.disabled = currentPage === totalPages;  // 修复原来的笔误
+  }
+
+  if (prevBtn) {
+    prevBtn.addEventListener("click", () => renderPage(currentPage - 1));
+  }
+  if (nextBtn) {
+    nextBtn.addEventListener("click", () => renderPage(currentPage + 1));
+  }
+
+  if (rows.length > 0) {
+    renderPage(1);
+  }
+
+  // ------- NL -> KQL：using /nl2kql -------
+
+  const nlInput = document.getElementById("nl-query-input");
+  const nlBtn = document.getElementById("nl2kql-btn");
+  const nlResult = document.getElementById("nl2kql-result");
+  const nlKqlText = document.getElementById("nl2kql-kql-text");
+  const nlExplText = document.getElementById("nl2kql-explanation-text");
+  const nlWarnText = document.getElementById("nl2kql-warnings-text");
+  const applyKqlBtn = document.getElementById("apply-kql-btn");
+  const applyAndRunBtn = document.getElementById("apply-and-run-btn");
+  const kqlInputEl = document.getElementById("kql-input");
+  const kqlFormEl = document.querySelector(".kql-form");
+
+  if (nlBtn && nlInput) {
+    nlBtn.addEventListener("click", async () => {
+      const text = nlInput.value.trim();
+      if (!text) return;
+
+      nlBtn.disabled = true;
+      nlBtn.textContent = "Thinking…";
+
+      try {
+        const res = await fetch("/nl2kql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text })
+        });
+
+        if (!res.ok) {
+          nlKqlText.textContent = "";
+          nlExplText.textContent = "Error status code.";
+          nlWarnText.textContent = "";
+          nlResult.classList.remove("hidden");
+          return;
+        }
+
+        const data = await res.json();
+        nlKqlText.textContent = data.kql || "";
+        nlExplText.textContent = data.explanation || "";
+        nlWarnText.textContent = data.warnings || "";
+        nlResult.classList.remove("hidden");
+      } catch (err) {
+        console.error(err);
+        nlKqlText.textContent = "";
+        nlExplText.textContent = "Wrong";
+        nlWarnText.textContent = "";
+        nlResult.classList.remove("hidden");
+      } finally {
+        nlBtn.disabled = false;
+        nlBtn.textContent = "|Ask AI|";
+      }
+    });
+  }
+
+  if (applyKqlBtn && kqlInputEl) {
+    applyKqlBtn.addEventListener("click", () => {
+      kqlInputEl.value = nlKqlText.textContent || "";
+    });
+  }
+
+  if (applyAndRunBtn && kqlInputEl && kqlFormEl) {
+    applyAndRunBtn.addEventListener("click", () => {
+      kqlInputEl.value = nlKqlText.textContent || "";
+      kqlFormEl.submit();
+    });
+  }
+</script>
+
+</body>
+</html>

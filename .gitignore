@@ -1,0 +1,9 @@
+# IDE & Python virtual env
+.idea/
+.venv/
+__pycache__
+
+# Sensitive config
+config.py
+Test.py
+Document/
