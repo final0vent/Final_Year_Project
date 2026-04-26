@@ -1,63 +1,24 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify,Response
 from datetime import datetime, timedelta
-import math
 import json
 import ipaddress
 from typing import Any, Dict, Tuple, List
 import traceback
+import uuid
 
-from prompts import GENERATE_KQL_PROMPT
 from kql_parser import filter_events_by_kql
 from analyzer import analyze_events_with_rules
-
-from google import genai
+from nl2kql import generate_kql_from_nl
+from performance_monitor import PerfMonitor
 import config
+import threading
 
 app = Flask(__name__)
-
-# -------- Gemini client --------
-
-client = genai.Client(api_key=config.GEMINI_API_KEY)
-
-def ask_gemini(prompt: str) -> str:
-    resp = client.models.generate_content(
-        model=config.MODEL,
-        contents=prompt
-    )
-    return (resp.text or "").strip()
-
-def generate_kql_from_nl(nl: str):
-    sys_prompt = GENERATE_KQL_PROMPT.format(nl=nl)
-    raw = ask_gemini(sys_prompt)
-
-    def extract_json(text: str) -> str:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return text[start:end + 1]
-        return text
-
-    json_text = extract_json(raw)
-
-    kql = ""
-    explanation = ""
-    warnings = ""
-
-    try:
-        data = json.loads(json_text)
-        kql = data.get("kql", "") or ""
-        explanation = data.get("explanation", "") or ""
-        warnings = data.get("warnings", "") or ""
-    except Exception:
-        explanation = f"Parsing failed, the original response is as follows:\n{raw}"
-        warnings = "Please check whether the LLM output format is valid."
-
-    return kql, explanation, warnings
-
-
-# ===================== ECS NDJSON ONLY =====================
+perf = PerfMonitor(config._PIPE, keep_last=300)
+perf_lock = threading.Lock()
 
 ECS_MIN_FIELDS = ["@timestamp", "event.category"]
+
 
 def _is_valid_ip(v: str) -> bool:
     try:
@@ -65,6 +26,7 @@ def _is_valid_ip(v: str) -> bool:
         return True
     except Exception:
         return False
+
 
 def _parse_ecs_timestamp(ts: str):
     try:
@@ -74,8 +36,8 @@ def _parse_ecs_timestamp(ts: str):
     except Exception:
         return None
 
+
 def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
-    """Convert to style: a.b.c: value"""
     items = {}
     for k, v in (d or {}).items():
         new_key = f"{parent_key}{sep}{k}" if parent_key else k
@@ -85,8 +47,8 @@ def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dic
             items[new_key] = v
     return items
 
-def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any], List[str]]:
 
+def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any], List[str]]:
     warnings = []
 
     for f in ECS_MIN_FIELDS:
@@ -115,9 +77,11 @@ def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any]
 
     src_ip = obj.get("source", {}).get("ip")
     dst_ip = obj.get("destination", {}).get("ip")
+
     if src_ip and not _is_valid_ip(src_ip):
         warnings.append(f"line {line_no}: invalid source.ip")
         src_ip = None
+
     if dst_ip and not _is_valid_ip(dst_ip):
         warnings.append(f"line {line_no}: invalid destination.ip")
         dst_ip = None
@@ -127,8 +91,12 @@ def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any]
     ev = {
         "id": line_no,
         "raw": json.dumps(obj, ensure_ascii=False),
+
+        # Keep original string + parsed dt + guaranteed ISO for frontend histogram
         "@timestamp": ts_raw,
         "timestamp_dt": ts_dt,
+        "@timestamp_iso": ts_dt.isoformat().replace("+00:00", "Z"),
+
         "message": obj.get("message", ""),
 
         "event.category": obj.get("event", {}).get("category"),
@@ -154,30 +122,38 @@ def normalize_ecs_row(obj: Dict[str, Any], line_no: int) -> Tuple[Dict[str, Any]
 
     return ev, warnings
 
+
 def parse_ndjson_file(file_storage):
-    """
-    File format:
-      - Line 1: header row, comma-separated (NOT JSON)
-      - Line 2..n: NDJSON rows (each line is a JSON object)
-    """
     events, errors, warns = [], [], []
     headers = []
 
     raw_lines = list(file_storage.stream)
 
-    header_line_no = None
+    # Find first non-empty line
+    first_line = None
+    first_line_no = None
     for i, raw in enumerate(raw_lines, start=1):
         line = raw.decode("utf-8", errors="ignore").strip()
         if line:
-            header_line_no = i
-            headers = [h.strip() for h in line.split(",") if h.strip()]
+            first_line = line
+            first_line_no = i
             break
 
-    if header_line_no is None:
+    if first_line is None:
         errors.append({"line": 1, "error": "empty file"})
         return [], errors, warns, []
 
-    for idx, raw in enumerate(raw_lines[header_line_no:], start=header_line_no + 1):
+    # Detect whether the file starts with JSON (NDJSON) or a CSV-like header
+    if first_line.lstrip().startswith("{"):
+        # NDJSON: parse from the first JSON line
+        start_line_no = first_line_no
+        headers = []
+    else:
+        # Header line present: treat it as headers, parse JSON starting from next line
+        headers = [h.strip() for h in first_line.split(",") if h.strip()]
+        start_line_no = first_line_no + 1
+
+    for idx, raw in enumerate(raw_lines[start_line_no - 1 :], start=start_line_no):
         line = raw.decode("utf-8", errors="ignore").strip()
         if not line:
             continue
@@ -196,107 +172,82 @@ def parse_ndjson_file(file_storage):
         events.append(ev)
         warns.extend(w)
 
+    # If no explicit headers, derive from first normalized event keys
+    if not headers and events:
+        # exclude noisy/internal keys if you want
+        headers = [k for k in events[0].keys() if not k.startswith("_")]
+
     return events, errors, warns, headers
 
+def build_histogram(events: List[Dict[str, Any]], n_buckets: int = 25):
+    if not events:
+        return None
 
+    dts = [e.get("timestamp_dt") for e in events if e.get("timestamp_dt") is not None]
+    if not dts:
+        return None
 
-# -------- Events over time --------
+    dts.sort()
+    start = dts[0]
+    end = dts[-1]
+    if start == end:
+        # all same timestamp -> one bucket
+        buckets = [{"label": start.strftime("%Y-%m-%d %H:%M:%S"), "count": len(dts), "height": 100}]
+        return {
+            "hist_buckets": buckets,
+            "hist_interval_label": "single",
+            "hist_y_ticks": [0, len(dts)],
+            "hist_x_start": start.strftime("%Y-%m-%d %H:%M"),
+            "hist_x_end": end.strftime("%Y-%m-%d %H:%M"),
+        }
 
-def pretty_interval(seconds: float) -> str:
-    if seconds < 60:
-        return f"{int(seconds)} s"
-    minutes = seconds / 60
-    if minutes < 60:
-        return f"{minutes:.1f} min"
-    hours = minutes / 60
-    if hours < 24:
-        return f"{hours:.1f} h"
-    days = hours / 24
-    return f"{days:.1f} d"
+    total_seconds = (end - start).total_seconds()
+    step = total_seconds / n_buckets
 
-def build_histogram(events):
-    ts_list = [e["timestamp_dt"] for e in events if e.get("timestamp_dt") is not None]
-    if not ts_list:
-        return [], None, [], None, None
-
-    ts_list.sort()
-    min_ts = ts_list[0]
-    max_ts = ts_list[-1]
-
-    total_seconds = (max_ts - min_ts).total_seconds()
-    if total_seconds <= 0:
-        total_seconds = 1.0
-
-    num_buckets = 25
-    interval_sec = total_seconds / num_buckets
-
-    counts = [0] * num_buckets
-
-    for ts in ts_list:
-        delta = (ts - min_ts).total_seconds()
-        idx = int(delta // interval_sec)
-        if idx >= num_buckets:
-            idx = num_buckets - 1
+    counts = [0] * n_buckets
+    for dt in dts:
+        idx = int((dt - start).total_seconds() / step)
+        if idx >= n_buckets:
+            idx = n_buckets - 1
         counts[idx] += 1
 
-    max_count = max(counts) if counts else 0
-
+    max_count = max(counts) if counts else 1
     buckets = []
-    for i in range(num_buckets):
-        bucket_start = min_ts + timedelta(seconds=i * interval_sec)
-        label = bucket_start.strftime("%m-%d\n%H:%M:%S")
-        count = counts[i]
-        if max_count > 0:
-            height = 10 + int(90 * (count / max_count))
-        else:
-            height = 10
-        buckets.append({
-            "label": label,
-            "count": count,
-            "height": height,
-        })
+    for i, c in enumerate(counts):
+        b_start = start + timedelta(seconds=i * step)
+        label = b_start.strftime("%Y-%m-%d %H:%M")
+        height = (c / max_count * 100.0) if max_count > 0 else 0
+        buckets.append({"label": label, "count": c, "height": round(height, 2)})
 
-    if max_count <= 0:
-        y_ticks = [0]
-    else:
-        step = max(1, math.ceil(max_count / 5))
-        y_ticks = list(range(0, max_count + 1, step))
-        if y_ticks[-1] != max_count:
-            y_ticks.append(max_count)
+    # y ticks (simple 0..max)
+    hist_y_ticks = [0, max_count // 2, max_count] if max_count >= 2 else [0, max_count]
 
-    interval_label = pretty_interval(interval_sec)
-    x_start_label = min_ts.strftime("%Y-%m-%d %H:%M:%S")
-    x_end_label = max_ts.strftime("%Y-%m-%d %H:%M:%S")
+    interval_label = f"{int(step)}s" if step < 120 else f"{int(step/60)}m"
 
-    return buckets, interval_label, y_ticks, x_start_label, x_end_label
+    return {
+        "hist_buckets": buckets,
+        "hist_interval_label": interval_label,
+        "hist_y_ticks": hist_y_ticks,
+        "hist_x_start": start.strftime("%Y-%m-%d %H:%M"),
+        "hist_x_end": end.strftime("%Y-%m-%d %H:%M"),
+    }
 
-
-# -------- Flask routes --------
 
 ALL_EVENTS = []
 LAST_FILENAME = None
 TABLE_HEADERS = []
 
+
 @app.route("/", methods=["GET", "POST"])
 def index():
-    global ALL_EVENTS, LAST_FILENAME
+    global ALL_EVENTS, LAST_FILENAME, TABLE_HEADERS
 
-    global TABLE_HEADERS
     events = ALL_EVENTS
     filename = LAST_FILENAME
     headers = TABLE_HEADERS
 
-    hist_buckets = []
-    hist_interval_label = None
-    hist_y_ticks = []
-    hist_x_start = None
-    hist_x_end = None
-
     parse_errors = []
     parse_warnings = []
-
-    has_rule_warnings = False
-    rule_warnings = []
 
     if request.method == "POST":
         uploaded = request.files.get("logfile")
@@ -315,63 +266,98 @@ def index():
     else:
         visible_events = events or []
 
+    has_rule_warnings = False
+    rule_warnings = []
+
     if visible_events:
         rule_result = analyze_events_with_rules(visible_events)
         has_rule_warnings = rule_result["has_warning"]
         rule_warnings = rule_result["warnings"]
 
-        (hist_buckets,
-         hist_interval_label,
-         hist_y_ticks,
-         hist_x_start,
-         hist_x_end) = build_histogram(visible_events)
+    hist = build_histogram(visible_events, n_buckets=25) if visible_events else None
 
     return render_template(
         "index.html",
         events=visible_events,
         filename=filename,
-        hist_buckets=hist_buckets,
-        hist_interval_label=hist_interval_label,
-        hist_y_ticks=hist_y_ticks,
-        hist_x_start=hist_x_start,
-        hist_x_end=hist_x_end,
         kql_query=kql_query,
         parse_errors=parse_errors[:200],
         parse_warnings=parse_warnings[:200],
         headers=headers,
-
         has_rule_warnings=has_rule_warnings,
         rule_warnings=rule_warnings,
+
+        hist_buckets=(hist or {}).get("hist_buckets"),
+        hist_interval_label=(hist or {}).get("hist_interval_label"),
+        hist_y_ticks=(hist or {}).get("hist_y_ticks"),
+        hist_x_start=(hist or {}).get("hist_x_start"),
+        hist_x_end=(hist or {}).get("hist_x_end"),
     )
 
 
 @app.route("/nl2kql", methods=["POST"])
 def nl2kql():
-    """
-    JSON in: { "text": "..." }
-    JSON out: { "kql": "...", "explanation": "...", "warnings": "..." }
-    """
     data = request.get_json(force=True, silent=True) or {}
     nl = (data.get("text") or "").strip()
+
     if not nl:
         return jsonify({"error": "empty input"}), 400
 
+    req_id = uuid.uuid4().hex[:10]
+
     try:
-        kql, explanation, warnings = generate_kql_from_nl(nl)
-        kql = kql.replace('"', '')
+        result = generate_kql_from_nl(nl, max_new_tokens=1024)
+
+        with perf_lock:
+            perf.record(timing=result.get("timing"))
+            perf_table = perf.last_table(10)
+
+        kql = (result.get("kql") or "").replace('"', "")
+
         return jsonify({
+            "request_id": req_id,
             "kql": kql,
-            "explanation": explanation,
-            "warnings": warnings,
+            "explanation": result.get("explanation", ""),
+            "warnings": result.get("warnings", ""),
+            "timing": result.get("timing", {}),
+            "perf_table": perf_table,
         })
+
     except Exception as e:
         traceback.print_exc()
+        with perf_lock:
+            perf_table = perf.last_table(10)
         return jsonify({
+            "request_id": req_id,
             "kql": "",
             "explanation": f"error: {e}",
             "warnings": "",
+            "perf_table": perf_table,
         }), 500
+
+@app.get("/perf")
+def perf_page():
+    with perf_lock:
+        table = perf.last_table(30)
+    html = f"""
+    <html>
+      <head>
+        <title>Perf Monitor</title>
+        <meta charset="utf-8"/>
+        <style>
+          body {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; padding: 16px; }}
+          pre {{ background: #f6f8fa; padding: 12px; border-radius: 8px; overflow-x: auto; }}
+          .hint {{ margin-bottom: 12px; color: #444; }}
+        </style>
+      </head>
+      <body>
+        <div class="hint">Showing last 30 records.</div>
+        <pre>{table}</pre>
+      </body>
+    </html>
+    """
+    return Response(html, mimetype="text/html")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)

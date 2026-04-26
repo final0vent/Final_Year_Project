@@ -143,7 +143,7 @@ def filter_events_by_kql(events: List[Dict[str, Any]], query: str) -> List[Dict[
         for op, cond in zip(operators, conditions[1:]):
             if op == "and":
                 result = result and event_matches_condition(ev, cond)
-            else:  # "or"
+            else:
                 result = result or event_matches_condition(ev, cond)
 
         if result:
